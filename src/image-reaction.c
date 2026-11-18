@@ -11,44 +11,53 @@
 #include <util/dstr.h>
 #include <sys/stat.h>
 #include <media-io/audio-math.h>
+#include <math.h>
 
 #define obs_log(level, format, ...) blog(level, "[image-reaction] " format, ##__VA_ARGS__)
+#define IR_PI 3.14159265f
+#define IR_BOUNCE_DURATION 0.22f
+#define IR_STATE_COUNT 3
 
 struct image_reaction_source {
 	obs_source_t *source;
 	char source_name[255];
 
-	char *file1;
-	char *file2;
+	char *files[IR_STATE_COUNT];
 	bool persistent;
 	bool linear_alpha;
 	bool active;
 
-	gs_image_file_ex_t if41;
-	gs_image_file_ex_t if42;
+	gs_image_file_ex_t images[IR_STATE_COUNT];
 
 	obs_weak_source_t *audio_source;
 
-	bool loud;
+	int state;
 	float threshold;
+	float loud_threshold;
 	float smoothness;
 	float average;
+
+	uint64_t hold_time_ns;
+	uint64_t last_sound_time;
+	uint64_t last_loud_time;
 
 	uint64_t last_time;
 	uint64_t capture_check_time;
 
-	bool animReset1;
-	bool animReset2;
-	bool loudOld;
-	bool animResetTrigger;
+	bool anim_reset[IR_STATE_COUNT];
+	bool anim_reset_trigger;
+
+	float bounce_amount;
+	float bounce_timer;
+	bool bounce_active;
+	bool bounce_trigger;
+
+	float breathing_amount;
+	float breathing_speed;
+	float breath_phase;
 };
 
-/*int MAX(int a, int b) {
-	return a > b ? a : b;
-}*/
-
-#define MIN(a, b) ((a)<(b) ? (a):(b))
-#define MAX(a, b) ((a)>(b) ? (a):(b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 static const char *image_reaction_source_get_name(void *unused)
 {
@@ -58,9 +67,9 @@ static const char *image_reaction_source_get_name(void *unused)
 
 static void image_reaction_source_load(struct image_reaction_source *context)
 {
-	for (int i = 0; i <= 1; i++) {
-		char *file = i == 0 ? context->file1 : context->file2;
-		gs_image_file_ex_t *if4 = i == 0 ? &context->if41 : &context->if42;
+	for (int i = 0; i < IR_STATE_COUNT; i++) {
+		char *file = context->files[i];
+		gs_image_file_ex_t *if4 = &context->images[i];
 
 		obs_enter_graphics();
 		gs_image_file_ex_free(if4);
@@ -85,8 +94,8 @@ static void image_reaction_source_load(struct image_reaction_source *context)
 static void image_reaction_source_unload(struct image_reaction_source *context)
 {
 	obs_enter_graphics();
-	gs_image_file_ex_free(&context->if41);
-	gs_image_file_ex_free(&context->if42);
+	for (int i = 0; i < IR_STATE_COUNT; i++)
+		gs_image_file_ex_free(&context->images[i]);
 	obs_leave_graphics();
 }
 
@@ -94,56 +103,86 @@ static void audio_capture(void *param, obs_source_t *src, const struct audio_dat
 {
 	(void)src;
 	struct image_reaction_source *context = param;
+	uint64_t now = os_gettime_ns();
+	int new_state = 0;
 
 	if (muted) {
-		context->average = 0;
+		context->average = 0.0f;
+		context->last_sound_time = 0;
+		context->last_loud_time = 0;
 	} else {
-		uint32_t samplesCount = data->frames;
+		uint32_t samples_count = data->frames;
 		float *samples = (float *)data->data[0];
+		float average_local = 0.0f;
 
-		float averageLocal = 0.0f;
-
-		for (uint32_t i = 0; i < samplesCount; i++) {
-			averageLocal += fabsf(samples[i]) / samplesCount;
+		if (samples_count > 0 && samples != NULL) {
+			for (uint32_t i = 0; i < samples_count; i++)
+				average_local += fabsf(samples[i]) / (float)samples_count;
 		}
 
-		context->average += context->smoothness * (averageLocal - context->average);
+		context->average += context->smoothness * (average_local - context->average);
+
+		bool has_file3 = context->files[2] && *context->files[2];
+		bool instant_loud = has_file3 && (context->average > context->loud_threshold);
+		bool instant_sound = context->average > context->threshold;
+
+		if (instant_loud) {
+			context->last_loud_time = now;
+			context->last_sound_time = now;
+		} else if (instant_sound) {
+			context->last_sound_time = now;
+		}
+
+		bool hold_loud = has_file3 && context->hold_time_ns > 0 && context->last_loud_time > 0 &&
+				 (now - context->last_loud_time <= context->hold_time_ns);
+		bool hold_sound = context->hold_time_ns > 0 && context->last_sound_time > 0 &&
+				  (now - context->last_sound_time <= context->hold_time_ns);
+
+		if (instant_loud || hold_loud)
+			new_state = 2;
+		else if (instant_sound || hold_sound)
+			new_state = 1;
 	}
 
-	context->loudOld = context->loud;
-	context->loud = context->average > context->threshold;
-
-	if (context->loud != context->loudOld)
-		context->animResetTrigger = true;
+	if (new_state != context->state) {
+		if (new_state > context->state)
+			context->bounce_trigger = true;
+		context->state = new_state;
+		context->anim_reset_trigger = true;
+	}
 }
 
 static void image_reaction_source_update(void *data, obs_data_t *settings)
 {
 	struct image_reaction_source *context = data;
-	const char *file1 = obs_data_get_string(settings, "file1");
-	const char *file2 = obs_data_get_string(settings, "file2");
-	const bool anim_reset_1 = obs_data_get_bool(settings, "anim_reset_1");
-	const bool anim_reset_2 = obs_data_get_bool(settings, "anim_reset_2");
+	const char *file_keys[IR_STATE_COUNT] = {"file1", "file2", "file3"};
+	const char *reset_keys[IR_STATE_COUNT] = {"anim_reset_1", "anim_reset_2", "anim_reset_3"};
+
+	for (int i = 0; i < IR_STATE_COUNT; i++) {
+		const char *file = obs_data_get_string(settings, file_keys[i]);
+		if (context->files[i])
+			bfree(context->files[i]);
+		context->files[i] = bstrdup(file);
+		context->anim_reset[i] = obs_data_get_bool(settings, reset_keys[i]);
+	}
+
 	const bool unload = obs_data_get_bool(settings, "unload");
 	const bool linear_alpha = obs_data_get_bool(settings, "linear_alpha");
 	const float threshold = (float)obs_data_get_double(settings, "threshold");
+	const float loud_threshold = (float)obs_data_get_double(settings, "loud_threshold");
 	const float smoothness = (float)obs_data_get_double(settings, "smoothness");
-
-	if (context->file1)
-		bfree(context->file1);
-	context->file1 = bstrdup(file1);
-
-	if (context->file2)
-		bfree(context->file2);
-	context->file2 = bstrdup(file2);
-
-	context->animReset1 = anim_reset_1;
-	context->animReset2 = anim_reset_2;
+	const double hold_time_ms = obs_data_get_double(settings, "hold_time_ms");
 
 	context->persistent = !unload;
 	context->linear_alpha = linear_alpha;
 	context->threshold = db_to_mul(threshold);
+	context->loud_threshold = db_to_mul(loud_threshold);
 	context->smoothness = powf(0.1f, smoothness);
+	context->hold_time_ns = hold_time_ms > 0.0 ? (uint64_t)(hold_time_ms * 1000000.0) : 0;
+
+	context->bounce_amount = (float)obs_data_get_double(settings, "bounce_amount");
+	context->breathing_amount = (float)obs_data_get_double(settings, "breathing_amount");
+	context->breathing_speed = (float)obs_data_get_double(settings, "breathing_speed");
 
 	/* Load the image if the source is persistent or showing */
 	if (context->persistent || obs_source_showing(context->source))
@@ -167,8 +206,8 @@ static void image_reaction_source_update(void *data, obs_data_t *settings)
 				old = context->audio_source;
 				context->audio_source = NULL;
 			}
-			strcpy(context->source_name, cfg_source_name);
-			context->capture_check_time = os_gettime_ns() - 3000000000;
+			snprintf(context->source_name, sizeof(context->source_name), "%s", cfg_source_name);
+			context->capture_check_time = os_gettime_ns() - 3000000000ULL;
 		}
 	}
 
@@ -189,7 +228,12 @@ static void image_reaction_source_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "linear_alpha", false);
 	obs_data_set_default_string(settings, "audio_source", "");
 	obs_data_set_default_double(settings, "threshold", -40.0);
+	obs_data_set_default_double(settings, "loud_threshold", -15.0);
 	obs_data_set_default_double(settings, "smoothness", 1.0);
+	obs_data_set_default_double(settings, "hold_time_ms", 150.0);
+	obs_data_set_default_double(settings, "bounce_amount", 12.0);
+	obs_data_set_default_double(settings, "breathing_amount", 4.0);
+	obs_data_set_default_double(settings, "breathing_speed", 1.5);
 }
 
 static void image_reaction_source_show(void *data)
@@ -214,7 +258,7 @@ static void *image_reaction_source_create(obs_data_t *settings, obs_source_t *so
 	context->source = source;
 
 	context->source_name[0] = '\0';
-	context->loud = false;
+	context->state = 0;
 
 	image_reaction_source_update(context, settings);
 	return context;
@@ -226,21 +270,11 @@ static void image_reaction_source_destroy(void *data)
 
 	image_reaction_source_unload(context);
 
-	if (context->file1)
-		bfree(context->file1);
+	for (int i = 0; i < IR_STATE_COUNT; i++) {
+		if (context->files[i])
+			bfree(context->files[i]);
+	}
 
-	if (context->file2)
-		bfree(context->file2);
-
-	/*if (context->audio_source) {
-		//obs_source_t *source = obs_weak_source_get_source(context->audio_source);
-		//if (source) {
-			obs_log(LOG_INFO, "Removed audio capture from '%s'", obs_source_get_name(context->audio_source));
-			obs_source_remove_audio_capture_callback(context->audio_source, audio_capture, context);
-			//obs_source_release(source);
-		//}
-		//obs_weak_source_release(context->audio_source);
-	}*/
 	if (context->audio_source) {
 		obs_source_t *source = obs_weak_source_get_source(context->audio_source);
 		if (source) {
@@ -257,13 +291,28 @@ static void image_reaction_source_destroy(void *data)
 static uint32_t image_reaction_source_getwidth(void *data)
 {
 	struct image_reaction_source *context = data;
-	return MAX(context->if41.cx, context->if42.cx);
+	uint32_t w = MAX(context->images[0].cx, context->images[1].cx);
+	return MAX(w, context->images[2].cx);
 }
 
 static uint32_t image_reaction_source_getheight(void *data)
 {
 	struct image_reaction_source *context = data;
-	return MAX(context->if41.cy, context->if42.cy);
+	uint32_t h = MAX(context->images[0].cy, context->images[1].cy);
+	return MAX(h, context->images[2].cy);
+}
+
+static gs_image_file_ex_t *get_active_image(struct image_reaction_source *context)
+{
+	int idx = context->state;
+	if (idx < 0 || idx >= IR_STATE_COUNT)
+		idx = 0;
+
+	if (context->images[idx].texture)
+		return &context->images[idx];
+	if (idx == 2 && context->images[1].texture)
+		return &context->images[1];
+	return &context->images[0];
 }
 
 static void image_reaction_source_render(void *data, gs_effect_t *effect)
@@ -275,14 +324,28 @@ static void image_reaction_source_render(void *data, gs_effect_t *effect)
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 
-	gs_image_file_ex_t *if4 = context->loud ? &context->if42 : &context->if41;
+	gs_image_file_ex_t *if4 = get_active_image(context);
 	if (if4->texture) {
+		float bounce_offset = 0.0f;
+		if (context->bounce_active && context->bounce_amount > 0.0f) {
+			float progress = context->bounce_timer / IR_BOUNCE_DURATION;
+			if (progress >= 0.0f && progress <= 1.0f)
+				bounce_offset = sinf(progress * IR_PI) * context->bounce_amount;
+		}
+
+		float breath_offset = sinf(context->breath_phase) * context->breathing_amount;
+		float offset_y = breath_offset - bounce_offset;
+
+		gs_matrix_push();
+		if (offset_y != 0.0f)
+			gs_matrix_translate3f(0.0f, offset_y, 0.0f);
+
 		gs_eparam_t *const param = gs_effect_get_param_by_name(effect, "image");
 		gs_effect_set_texture_srgb(param, if4->texture);
 
 		gs_draw_sprite(if4->texture, 0, if4->cx, if4->cy);
+		gs_matrix_pop();
 	}
-	//context->loud = false;
 
 	gs_blend_state_pop();
 
@@ -291,16 +354,39 @@ static void image_reaction_source_render(void *data, gs_effect_t *effect)
 
 static void image_reaction_tick(void *data, float seconds)
 {
-	(void)seconds;
-
 	struct image_reaction_source *context = data;
 
-	// Update / refresh audio capturing
+	/* Update natural breathing & bounce animation */
+	if (context->breathing_amount > 0.0f) {
+		context->breath_phase += seconds * context->breathing_speed * 2.0f;
+		if (context->breath_phase > 2.0f * IR_PI)
+			context->breath_phase -= 2.0f * IR_PI;
+	} else {
+		context->breath_phase = 0.0f;
+	}
+
+	if (context->bounce_trigger) {
+		context->bounce_trigger = false;
+		if (context->bounce_amount > 0.0f) {
+			context->bounce_active = true;
+			context->bounce_timer = 0.0f;
+		}
+	}
+
+	if (context->bounce_active) {
+		context->bounce_timer += seconds;
+		if (context->bounce_timer >= IR_BOUNCE_DURATION) {
+			context->bounce_active = false;
+			context->bounce_timer = 0.0f;
+		}
+	}
+
+	/* Update / refresh audio capturing */
 	char *new_name = NULL;
 	if (context->source_name[0] != '\0' && !context->audio_source) {
 		uint64_t t = os_gettime_ns();
 
-		if (t - context->capture_check_time > 3000000000) {
+		if (t - context->capture_check_time > 3000000000ULL) {
 			new_name = context->source_name;
 			context->capture_check_time = t;
 		}
@@ -323,19 +409,22 @@ static void image_reaction_tick(void *data, float seconds)
 		}
 	}
 
-	// update GIF's
+	/* Update GIFs */
 	uint64_t frame_time = obs_get_video_frame_time();
 	if (obs_source_active(context->source)) {
 		if (!context->active) {
-			if (context->if41.is_animated_gif || context->if42.is_animated_gif)
-				context->last_time = frame_time;
+			for (int i = 0; i < IR_STATE_COUNT; i++) {
+				if (context->images[i].is_animated_gif) {
+					context->last_time = frame_time;
+					break;
+				}
+			}
 			context->active = true;
 		}
-
 	} else {
 		if (context->active) {
-			for (int i = 0; i <= 1; i++) {
-				gs_image_file_ex_t *if4 = i == 0 ? &context->if41 : &context->if42;
+			for (int i = 0; i < IR_STATE_COUNT; i++) {
+				gs_image_file_ex_t *if4 = &context->images[i];
 				if (if4->is_animated_gif) {
 					if4->cur_frame = 0;
 					if4->cur_loop = 0;
@@ -351,12 +440,12 @@ static void image_reaction_tick(void *data, float seconds)
 		}
 	}
 
-	for (int i = 0; i <= 1; i++) {
-		gs_image_file_ex_t *if4 = i == 0 ? &context->if41 : &context->if42;
-		bool animReset = i == 0 ? context->animReset1 : context->animReset2;
+	for (int i = 0; i < IR_STATE_COUNT; i++) {
+		gs_image_file_ex_t *if4 = &context->images[i];
+		bool anim_reset = context->anim_reset[i];
 
 		if (context->last_time && if4->is_animated_gif) {
-			if (animReset && context->animResetTrigger) {
+			if (anim_reset && context->anim_reset_trigger) {
 				if4->cur_frame = 0;
 				if4->cur_loop = 0;
 				if4->cur_time = 0;
@@ -376,7 +465,7 @@ static void image_reaction_tick(void *data, float seconds)
 			}
 		}
 	}
-	context->animResetTrigger = false;
+	context->anim_reset_trigger = false;
 
 	context->last_time = frame_time;
 }
@@ -404,14 +493,6 @@ static bool add_source(void *param, obs_source_t *src)
 	return true;
 }
 
-static bool source_changed(obs_properties_t *props, obs_property_t *prop, obs_data_t *data)
-{
-	(void)props;
-	(void)prop;
-	obs_data_get_string(data, "audio_source");
-	return true;
-}
-
 static obs_properties_t *image_reaction_source_properties(void *data)
 {
 	struct image_reaction_source *s = data;
@@ -419,10 +500,10 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 
 	obs_properties_t *props = obs_properties_create();
 
-	if (s && s->file1 && *s->file1) {
+	if (s && s->files[0] && *s->files[0]) {
 		const char *slash;
 
-		dstr_copy(&path, s->file1);
+		dstr_copy(&path, s->files[0]);
 		dstr_replace(&path, "\\", "/");
 		slash = strrchr(path.array, '/');
 		if (slash)
@@ -433,6 +514,8 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 	obs_properties_add_bool(props, "anim_reset_1", obs_module_text("AnimReset1"));
 	obs_properties_add_path(props, "file2", obs_module_text("Reaction2"), OBS_PATH_FILE, image_filter, path.array);
 	obs_properties_add_bool(props, "anim_reset_2", obs_module_text("AnimReset2"));
+	obs_properties_add_path(props, "file3", obs_module_text("Reaction3"), OBS_PATH_FILE, image_filter, path.array);
+	obs_properties_add_bool(props, "anim_reset_3", obs_module_text("AnimReset3"));
 	dstr_free(&path);
 
 	obs_properties_add_bool(props, "unload", obs_module_text("UnloadWhenNotShowing"));
@@ -445,9 +528,23 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 		obs_properties_add_float_slider(props, "threshold", obs_module_text("Threshold"), -60.0, 0.0, 0.1);
 	obs_property_float_set_suffix(p, " dB");
 
+	p = obs_properties_add_float_slider(props, "loud_threshold", obs_module_text("LoudThreshold"), -60.0, 0.0, 0.1);
+	obs_property_float_set_suffix(p, " dB");
+
 	obs_properties_add_float_slider(props, "smoothness", obs_module_text("Smoothness"), 0.0, 5.0, 0.1);
 
-	//obs_property_set_modified_callback(src, source_changed);
+	p = obs_properties_add_float_slider(props, "hold_time_ms", obs_module_text("HoldTime"), 0.0, 2000.0, 10.0);
+	obs_property_float_set_suffix(p, " ms");
+
+	p = obs_properties_add_float_slider(props, "bounce_amount", obs_module_text("BounceAmount"), 0.0, 100.0, 1.0);
+	obs_property_float_set_suffix(p, " px");
+
+	p = obs_properties_add_float_slider(props, "breathing_amount", obs_module_text("BreathingAmount"), 0.0, 50.0,
+					    0.5);
+	obs_property_float_set_suffix(p, " px");
+
+	obs_properties_add_float_slider(props, "breathing_speed", obs_module_text("BreathingSpeed"), 0.1, 5.0, 0.1);
+
 	obs_enum_sources(add_source, sources_list);
 
 	return props;
@@ -456,20 +553,10 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 uint64_t image_reaction_source_get_memory_usage(void *data)
 {
 	struct image_reaction_source *s = data;
-	return s->if41.mem_usage + s->if42.mem_usage;
-}
-
-static void missing_file_callback(void *src, const char *new_path, void *data)
-{
-	struct image_reaction_source *s = src;
-
-	obs_source_t *source = s->source;
-	obs_data_t *settings = obs_source_get_settings(source);
-	obs_data_set_string(settings, "file", new_path);
-	obs_source_update(source, settings);
-	obs_data_release(settings);
-
-	UNUSED_PARAMETER(data);
+	uint64_t total = 0;
+	for (int i = 0; i < IR_STATE_COUNT; i++)
+		total += s->images[i].mem_usage;
+	return total;
 }
 
 static struct obs_source_info image_reaction_source_info = {
@@ -497,8 +584,6 @@ MODULE_EXPORT const char *obs_module_description(void)
 {
 	return "Image reaction source";
 }
-
-extern struct obs_source_info slideshow_info;
 
 bool obs_module_load(void)
 {
